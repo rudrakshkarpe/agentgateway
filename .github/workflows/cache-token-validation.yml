@@ -1,0 +1,75 @@
+name: Cache token metrics validation
+on:
+  push:
+    branches: [validation/cache-token-metrics]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 2
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cache-token-metrics-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - run: rustup show
+      - name: Format
+        run: cargo fmt -- --config imports_granularity=Module,group_imports=StdExternalCrate,normalize_comments=true
+      - name: Regression on original implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp crates/agentgateway/src/telemetry/metrics.rs /tmp/cache-metrics-fixed.rs
+          cp crates/agentgateway/src/telemetry/log.rs /tmp/cache-log-fixed.rs
+          trap 'cp /tmp/cache-metrics-fixed.rs crates/agentgateway/src/telemetry/metrics.rs; cp /tmp/cache-log-fixed.rs crates/agentgateway/src/telemetry/log.rs' EXIT
+          git fetch origin f02845731ab0c037781e11358824e51d9e5c34f0 --depth=1
+          git show f02845731ab0c037781e11358824e51d9e5c34f0:crates/agentgateway/src/telemetry/metrics.rs > crates/agentgateway/src/telemetry/metrics.rs
+          python3 - <<'PYCODE'
+          import pathlib, subprocess
+          p = pathlib.Path('crates/agentgateway/src/telemetry/log.rs')
+          original = subprocess.check_output(['git', 'show', 'f02845731ab0c037781e11358824e51d9e5c34f0:' + str(p)], text=True)
+          current = p.read_text()
+          start = '\t\t\tif let Some(crt) = llm_response.cached_input_tokens {'
+          end = '\t\t\tif let Some(ttft) = llm_response'
+          p.write_text(current[:current.index(start)] + original[original.index(start):original.index(end)] + current[current.index(end):])
+          PYCODE
+          if cargo test --locked -p agentgateway --lib gen_ai_token_metrics > regression.log 2>&1; then
+            cat regression.log
+            exit 1
+          fi
+          tail -80 regression.log
+          grep -q 'test result: FAILED' regression.log
+          grep -q 'gen_ai_token_metrics_separate_cache_detail_from_totals.*FAILED' regression.log
+      - name: Regression after fix
+        run: cargo test --locked -p agentgateway --lib gen_ai_token_metrics
+      - name: Generate metric catalog
+        run: |
+          cargo xtask metrics
+          git diff --exit-code -- schema/metrics.md
+      - name: Tests
+        run: make test
+      - name: Lint
+        run: make lint
+      - name: Save verification outputs
+        if: always()
+        run: git diff > validation-format.patch
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cache-token-validation
+          path: |
+            regression.log
+            validation-format.patch
